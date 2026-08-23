@@ -207,9 +207,9 @@ def run_evaluation(config: Config) -> None:
 
     print("\n+==============================================+")
     print(f"|      2-QUBIT EVALUATION RESULTS ({num_test_states} states)    |")
-    print("+==================+============+=============="+)
+    print("+==================+============+==============+")
     print("| Metric           |    DQN     |     PPO      |")
-    print("+==================+============+=============="+)
+    print("+==================+============+==============+")
     print(f"| Mean Fidelity    |   {dqn_mean_fid:.4f}   |    {ppo_mean_fid:.4f}    |")
     print(f"| Median Fidelity  |   {dqn_median_fid:.4f}   |    {ppo_median_fid:.4f}    |")
     print(f"| Success Rate     |   {dqn_success:6.1f}%   |    {ppo_success:6.1f}%    |")

@@ -21,3 +21,21 @@ env/
 
 # TensorBoard / temporary run logs
 runs/
+
+# Trained model weights (large binaries — do not commit)
+*.pth
+
+# Generated script outputs (circuit diagrams, QASM)
+outputs/
+
+# Temporary debug files
+test_circuit.png
+
+# Generated training logs and plots
+quantumrl/logs/*.txt
+quantumrl/plots/
+logs/
+plots/
+
+# Validation backup (keep locally, not in remote)
+quantumrl/config_2qubit_backup.py
