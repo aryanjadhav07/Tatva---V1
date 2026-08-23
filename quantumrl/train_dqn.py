@@ -33,16 +33,22 @@ def set_seeds(seed: int) -> None:
 
 
 def train_dqn(config: Config) -> None:
-    """Full DQN training loop for 2-qubit system."""
+    """Full DQN training loop for QuantumRL."""
     set_seeds(config.SEED)
 
     env = QuantumCircuitEnv(config)
-    obs_size = env.observation_space.shape[0]   # 18
-    action_size = env.action_space.n              # 154
+    obs_size = env.observation_space.shape[0]
+    action_size = env.action_space.n
 
+    print(f"[DQN] Training configuration: {config.NUM_QUBITS} Qubit(s)")
     print(f"[DQN] obs_size={obs_size}  action_size={action_size}")
     agent = DQNAgent(obs_size, action_size, config)
     print(f"[DQN] Training device: {agent.device}")
+
+    # Checkpoint save guard
+    if os.path.exists(config.DQN_MODEL_PATH):
+        print(f"[DQN][SAVE-GUARD] Warning: Existing model found at '{config.DQN_MODEL_PATH}'. "
+              f"New checkpoints will overwrite this file.")
 
     # Replay buffer warm-up (10000 random transitions)
     warmup_steps = getattr(config, 'DQN_WARMUP_STEPS', 10000)
@@ -138,6 +144,7 @@ def train_dqn(config: Config) -> None:
     )
 
     print(f"\n[DQN] Training complete.")
+    print(f"[DQN] Final Epsilon value: {agent.epsilon:.6f}")
     print(f"[DQN] Final 100-episode mean fidelity: {final_mean_fidelity:.4f}")
     print(f"[DQN] Best 100-episode mean fidelity:  {best_mean_fidelity:.4f}")
 

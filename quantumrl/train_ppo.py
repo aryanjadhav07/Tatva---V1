@@ -35,7 +35,7 @@ def set_seeds(seed: int) -> None:
 
 
 def train_ppo(config: Config) -> None:
-    """Main training loop for PPO agent scaled to 2 qubits."""
+    """Main training loop for PPO agent in QuantumRL."""
     set_seeds(config.SEED)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -45,10 +45,16 @@ def train_ppo(config: Config) -> None:
         print(f"[PPO] GPU Detected   : {gpu_name}")
 
     env = QuantumCircuitEnv(config)
-    obs_size = env.observation_space.shape[0]   # 18
-    action_size = env.action_space.n              # 154
+    obs_size = env.observation_space.shape[0]
+    action_size = env.action_space.n
 
+    print(f"[PPO] Training configuration: {config.NUM_QUBITS} Qubit(s)")
     print(f"[PPO] obs_size={obs_size}  action_size={action_size}")
+
+    # Checkpoint save guard
+    if os.path.exists(config.PPO_MODEL_PATH):
+        print(f"[PPO][SAVE-GUARD] Warning: Existing model found at '{config.PPO_MODEL_PATH}'. "
+              f"New checkpoints will overwrite this file.")
 
     agent = PPOAgent(obs_size, action_size, config, device)
     buffer = RolloutBuffer(config.PPO_ROLLOUT_STEPS, obs_size, device)
@@ -111,14 +117,15 @@ def train_ppo(config: Config) -> None:
                         f"Fidelity: {info['fidelity']:.4f} | "
                         f"Steps: {info['steps']:2d} | "
                         f"LR: {current_lr:.2e} | "
-                        f"Mean Fid (100): {mean_fid:.4f}"
+                        f"Mean Fid (100): {mean_fid:.4f}",
+                        flush=True
                     )
 
                     if mean_fid > best_mean_fidelity:
                         best_mean_fidelity = mean_fid
                         agent.save(best_model_path)
                         agent.save(config.PPO_MODEL_PATH)
-                        print(f"  *** New best model saved: {mean_fid:.4f} ***")
+                        print(f"  *** New best model saved: {mean_fid:.4f} ***", flush=True)
 
                 if current_episode >= config.PPO_EPISODES:
                     break

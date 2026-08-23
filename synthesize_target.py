@@ -91,16 +91,16 @@ PRESETS: Dict[str, Optional[np.ndarray]] = {
 
 NORM_TOLERANCE = 1e-5
 
-# ── 1-qubit Config override ────────────────────────────────────────────────────
-# The live Config() is 2-qubit; we need a 1-qubit env for inference.
-# Python dataclasses don't allow overriding default values via subclass annotation
-# without re-declaring the full dataclass, so we patch the instance directly.
-
+# ── 1-qubit Config loader ──────────────────────────────────────────────────────
 def _make_one_qubit_config() -> Config:
-    """Return a Config instance with NUM_QUBITS patched to 1."""
-    cfg = Config()
-    cfg.NUM_QUBITS = 1
-    return cfg
+    """Return a standalone 1-qubit Config instance."""
+    try:
+        from configs.config_1qubit import Config as Config1Qubit
+        return Config1Qubit()
+    except ImportError:
+        cfg = Config()
+        cfg.NUM_QUBITS = 1
+        return cfg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -543,7 +543,13 @@ def print_agent_result(
 
     print(f"\n  ASCII Circuit Diagram:")
     print()
-    env.render()
+    try:
+        env.render()
+    except (UnicodeEncodeError, Exception) as exc:
+        try:
+            print(str(env.current_circuit.draw('text')).encode('ascii', errors='replace').decode('ascii'))
+        except Exception:
+            print("  (ASCII diagram omitted due to console encoding limitations)")
 
     print(f"\n  Saved outputs:")
     print(f"    PNG  : {png_path}")
@@ -732,9 +738,19 @@ def main() -> None:
     print(f"{'=' * 60}")
 
     # ── Resolve model file paths ──────────────────────────────────────────────
-    # config.*_MODEL_PATH is relative to quantumrl/; resolve from there.
-    dqn_model_path = os.path.join(QUANTUMRL_DIR, config_1q.DQN_MODEL_PATH)
-    ppo_model_path = os.path.join(QUANTUMRL_DIR, config_1q.PPO_MODEL_PATH)
+    def _resolve_model_path(rel_path: str) -> str:
+        candidates = [
+            os.path.join(QUANTUMRL_DIR, rel_path),
+            os.path.join(SCRIPT_DIR, rel_path),
+            rel_path,
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return candidates[0]
+
+    dqn_model_path = _resolve_model_path(config_1q.DQN_MODEL_PATH)
+    ppo_model_path = _resolve_model_path(config_1q.PPO_MODEL_PATH)
 
     # ── Load requested agents ─────────────────────────────────────────────────
     print()

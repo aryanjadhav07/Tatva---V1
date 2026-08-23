@@ -98,8 +98,9 @@ def plot_comparison(
     dqn_results: dict,
     ppo_results: dict,
     save_path: str,
+    num_qubits: int = 1,
 ) -> None:
-    """Save a four-metric grouped bar chart comparing DQN vs. PPO on 2-qubit synthesis."""
+    """Save a four-metric grouped bar chart comparing DQN vs. PPO."""
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
 
     metrics = ['Mean Fidelity', 'Median Fidelity', 'Success Rate (%)', 'Avg Gate Count']
@@ -122,7 +123,7 @@ def plot_comparison(
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
     fig.patch.set_facecolor('#1a1a2e')
-    fig.suptitle('DQN vs PPO — 2-Qubit Evaluation Comparison (500 Test States)', color='white', fontsize=14, fontweight='bold')
+    fig.suptitle(f'DQN vs PPO — {num_qubits}-Qubit Evaluation Comparison ({len(dqn_results["fidelities"])} Test States)', color='white', fontsize=14, fontweight='bold')
 
     colors_dqn = '#e94560'
     colors_ppo = '#0f9b8e'
@@ -156,10 +157,10 @@ def plot_comparison(
 
 
 def run_evaluation(config: Config) -> None:
-    """Load saved 2-qubit models and run full evaluation on 500 held-out test states."""
+    """Load saved models and run full evaluation on held-out test states."""
     test_seed = config.SEED + 999
     num_test_states = config.NUM_TEST_STATES
-    print(f"[evaluate] Generating {num_test_states} 2-qubit test states (seed={test_seed}) ...")
+    print(f"[evaluate] Generating {num_test_states} {config.NUM_QUBITS}-qubit test states (seed={test_seed}) ...")
     test_states = generate_target_states(
         config.NUM_QUBITS, num_test_states, seed=test_seed
     )
@@ -187,7 +188,7 @@ def run_evaluation(config: Config) -> None:
     ppo_agent = PPOAgent(obs_size, action_size, config, device)
     ppo_agent.load(config.PPO_MODEL_PATH)
 
-    print("\n[evaluate] Evaluating DQN on 2-qubit test set ...")
+    print(f"\n[evaluate] Evaluating DQN on {config.NUM_QUBITS}-qubit test set ...")
     dqn_results = evaluate_dqn(dqn_agent, env, test_states, config)
 
     dqn_mean_fid = float(np.mean(dqn_results['fidelities']))
@@ -196,7 +197,7 @@ def run_evaluation(config: Config) -> None:
     dqn_succ_gates = [g for g, s in zip(dqn_results['gate_counts'], dqn_results['successes']) if s]
     dqn_mean_gates = float(np.mean(dqn_succ_gates)) if dqn_succ_gates else float('nan')
 
-    print("[evaluate] Evaluating PPO on 2-qubit test set ...")
+    print(f"[evaluate] Evaluating PPO on {config.NUM_QUBITS}-qubit test set ...")
     ppo_results = evaluate_ppo(ppo_agent, env, test_states, config)
 
     ppo_mean_fid = float(np.mean(ppo_results['fidelities']))
@@ -206,7 +207,7 @@ def run_evaluation(config: Config) -> None:
     ppo_mean_gates = float(np.mean(ppo_succ_gates)) if ppo_succ_gates else float('nan')
 
     print("\n+==============================================+")
-    print(f"|      2-QUBIT EVALUATION RESULTS ({num_test_states} states)    |")
+    print(f"|      {config.NUM_QUBITS}-QUBIT EVALUATION RESULTS ({num_test_states} states)    |")
     print("+==================+============+==============+")
     print("| Metric           |    DQN     |     PPO      |")
     print("+==================+============+==============+")
@@ -216,8 +217,8 @@ def run_evaluation(config: Config) -> None:
     print(f"| Avg Gate Count   |    {dqn_mean_gates:6.1f}    |     {ppo_mean_gates:6.1f}     |")
     print("+==================+============+==============+")
 
-    save_plot_path = os.path.join('plots', 'dqn_vs_ppo_comparison.png')
-    plot_comparison(dqn_results, ppo_results, save_plot_path)
+    save_plot_path = os.path.join(config.PLOT_DIR, 'dqn_vs_ppo_comparison.png')
+    plot_comparison(dqn_results, ppo_results, save_plot_path, num_qubits=config.NUM_QUBITS)
 
     print("\n[evaluate] Evaluation complete.")
 
