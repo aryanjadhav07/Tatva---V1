@@ -69,7 +69,7 @@ sys.path.insert(0, QUANTUMRL_DIR)
 
 from config import Config
 from quantum_env import QuantumCircuitEnv
-from utils import generate_random_statevector
+from utils import best_checkpoint_path, generate_random_statevector
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 OUTPUTS_DIR = os.path.join(SCRIPT_DIR, 'outputs')
@@ -687,6 +687,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Skips the interactive amplitude prompt when provided."
         ),
     )
+    parser.add_argument(
+        '--use-best',
+        action='store_true',
+        default=False,
+        help=(
+            'Load the best checkpoint (e.g. dqn_model_best.pth / ppo_model_best.pth) '
+            'instead of the final saved model.  The best checkpoint is written '
+            'automatically during training at every BEST_CHECKPOINT_EVAL_INTERVAL episodes.'
+        ),
+    )
     return parser
 
 
@@ -751,6 +761,13 @@ def main() -> None:
 
     dqn_model_path = _resolve_model_path(config_1q.DQN_MODEL_PATH)
     ppo_model_path = _resolve_model_path(config_1q.PPO_MODEL_PATH)
+
+    if args.use_best:
+        dqn_model_path = _resolve_model_path(best_checkpoint_path(config_1q.DQN_MODEL_PATH))
+        ppo_model_path = _resolve_model_path(best_checkpoint_path(config_1q.PPO_MODEL_PATH))
+        print(f"[synthesize] --use-best: using best checkpoints.")
+        print(f"[synthesize]   DQN: {dqn_model_path}")
+        print(f"[synthesize]   PPO: {ppo_model_path}")
 
     # ── Load requested agents ─────────────────────────────────────────────────
     print()

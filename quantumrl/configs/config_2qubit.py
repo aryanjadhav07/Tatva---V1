@@ -86,6 +86,18 @@ class Config:
     NUM_TEST_STATES: int = 500
     SEED: int = 42
 
+    # ──────────────────────────────────────────────
+    # Best-checkpoint tracking
+    # ──────────────────────────────────────────────
+    # How often (in episodes) to run lightweight greedy evaluation during training.
+    # At each interval a small held-out set is evaluated and the model is saved if
+    # it beats the best mean fidelity seen so far.
+    BEST_CHECKPOINT_EVAL_INTERVAL: int = 1000
+    # Number of freshly generated Haar-random states used for each lightweight
+    # checkpoint evaluation.  Fresh states are drawn at every evaluation point so
+    # no fixed held-out set is reused, keeping the signal unbiased.
+    BEST_CHECKPOINT_EVAL_STATES: int = 50
+
     LOG_ACTION_HISTOGRAM: bool = True
 
     # Curriculum learning (disabled: fully random Haar states for generalization)

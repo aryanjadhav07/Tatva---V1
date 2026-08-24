@@ -263,3 +263,37 @@ def load_logs(filepath: str) -> dict:
     """
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+# ─────────────────────────────────────────────────────────
+# Checkpoint path utilities
+# ─────────────────────────────────────────────────────────
+
+def best_checkpoint_path(model_path: str) -> str:
+    """
+    Derive the *_best* checkpoint path from a configured model path.
+
+    Inserts ``_best`` immediately before the file extension so the naming
+    convention is consistent regardless of qubit count or directory layout.
+
+    Examples
+    --------
+    >>> best_checkpoint_path('saved_models/1qubit/dqn_model.pth')
+    'saved_models/1qubit/dqn_model_best.pth'
+    >>> best_checkpoint_path('saved_models/2qubit/ppo_model.pth')
+    'saved_models/2qubit/ppo_model_best.pth'
+    >>> best_checkpoint_path('model')   # no extension
+    'model_best'
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the final (non-best) model checkpoint as stored in Config.
+
+    Returns
+    -------
+    str
+        Path with ``_best`` inserted before the file extension.
+    """
+    root, ext = os.path.splitext(model_path)
+    return f"{root}_best{ext}"

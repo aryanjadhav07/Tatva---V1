@@ -11,6 +11,7 @@ Run with:
     python evaluate.py
 """
 
+import argparse
 import os
 import sys
 
@@ -26,7 +27,7 @@ from config import Config
 from dqn_agent import DQNAgent
 from ppo_agent import PPOAgent
 from quantum_env import QuantumCircuitEnv
-from utils import generate_target_states
+from utils import best_checkpoint_path, generate_target_states
 
 
 def evaluate_dqn(agent: DQNAgent, env: QuantumCircuitEnv, test_states, config: Config):
@@ -156,8 +157,19 @@ def plot_comparison(
     print(f"[evaluate] Comparison chart saved -> {save_path}")
 
 
-def run_evaluation(config: Config) -> None:
-    """Load saved models and run full evaluation on held-out test states."""
+def run_evaluation(config: Config, use_best: bool = False) -> None:
+    """Load saved models and run full evaluation on held-out test states.
+
+    Parameters
+    ----------
+    config : Config
+        Active configuration object.
+    use_best : bool
+        When True, load the *_best* checkpoint instead of the final model.
+        The best-checkpoint path is derived from the configured model path via
+        ``best_checkpoint_path()``.  If the file does not exist the function
+        exits with a clear error message.
+    """
     test_seed = config.SEED + 999
     num_test_states = config.NUM_TEST_STATES
     print(f"[evaluate] Generating {num_test_states} {config.NUM_QUBITS}-qubit test states (seed={test_seed}) ...")
@@ -170,23 +182,38 @@ def run_evaluation(config: Config) -> None:
     action_size = env.action_space.n
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    if not os.path.exists(config.DQN_MODEL_PATH):
+    # ── Resolve model paths ───────────────────────────────────────────────────
+    dqn_path = best_checkpoint_path(config.DQN_MODEL_PATH) if use_best else config.DQN_MODEL_PATH
+    ppo_path = best_checkpoint_path(config.PPO_MODEL_PATH) if use_best else config.PPO_MODEL_PATH
+
+    if use_best:
+        print(f"[evaluate] --use-best: loading best checkpoints.")
+        print(f"[evaluate]   DQN: {dqn_path}")
+        print(f"[evaluate]   PPO: {ppo_path}")
+
+    if not os.path.exists(dqn_path):
+        label = "best-checkpoint" if use_best else "final model"
         raise FileNotFoundError(
-            f"DQN model not found at {config.DQN_MODEL_PATH}. "
-            "Run train_dqn.py first."
+            f"DQN {label} not found at {dqn_path}. "
+            + ("Run train_dqn.py first — a best checkpoint is saved automatically "
+               "once the first eval interval completes." if use_best
+               else "Run train_dqn.py first.")
         )
 
     dqn_agent = DQNAgent(obs_size, action_size, config)
-    dqn_agent.load(config.DQN_MODEL_PATH)
+    dqn_agent.load(dqn_path)
 
-    if not os.path.exists(config.PPO_MODEL_PATH):
+    if not os.path.exists(ppo_path):
+        label = "best-checkpoint" if use_best else "final model"
         raise FileNotFoundError(
-            f"PPO model not found at {config.PPO_MODEL_PATH}. "
-            "Run train_ppo.py first."
+            f"PPO {label} not found at {ppo_path}. "
+            + ("Run train_ppo.py first — a best checkpoint is saved automatically "
+               "once the first eval interval completes." if use_best
+               else "Run train_ppo.py first.")
         )
 
     ppo_agent = PPOAgent(obs_size, action_size, config, device)
-    ppo_agent.load(config.PPO_MODEL_PATH)
+    ppo_agent.load(ppo_path)
 
     print(f"\n[evaluate] Evaluating DQN on {config.NUM_QUBITS}-qubit test set ...")
     dqn_results = evaluate_dqn(dqn_agent, env, test_states, config)
@@ -224,5 +251,19 @@ def run_evaluation(config: Config) -> None:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Evaluate trained DQN and PPO agents on a held-out test set.',
+    )
+    parser.add_argument(
+        '--use-best',
+        action='store_true',
+        default=False,
+        help=(
+            'Load the best checkpoint (e.g. dqn_model_best.pth) instead of '
+            'the final saved model.  The best checkpoint is saved automatically '
+            'during training at every BEST_CHECKPOINT_EVAL_INTERVAL episodes.'
+        ),
+    )
+    args = parser.parse_args()
     cfg = Config()
-    run_evaluation(cfg)
+    run_evaluation(cfg, use_best=args.use_best)
