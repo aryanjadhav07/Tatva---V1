@@ -3,9 +3,9 @@ synthesize_target.py
 --------------------
 Standalone inference script: Target State → Quantum Circuit
 
-Given a user-specified target quantum state, loads the trained DQN and/or PPO
-agent weights and runs greedy (non-exploratory) inference from |0⟩ to
-synthesize a gate sequence that reaches that state.
+Given a user-specified target quantum state, runs both trained agents (DQN and
+PPO) and automatically selects the best result using a deterministic four-step
+rule.  The non-selected agent's result is retained as secondary data.
 
 Supports two saved-model layouts automatically (detected by key inspection):
 
@@ -18,20 +18,16 @@ Supports two saved-model layouts automatically (detected by key inspection):
     obs=10, action=76, hidden=768/384
     DQN keys: feature_trunk.*, value_stream.*, advantage_stream.*
     PPO keys: actor.0.*, ..., actor.9.* / critic.0.*, ..., critic.9.*
-              (same Sequential layout as legacy, different hidden dims)
-
-This script defines compatible network wrappers for both layouts so .pth files
-load cleanly without touching any training pipeline files.
 
 Usage
 -----
   # Interactive mode (no arguments):
       python synthesize_target.py
 
-  # CLI mode (all arguments):
-      python synthesize_target.py --target plus --agent both
+  # CLI mode:
+      python synthesize_target.py --target plus
       python synthesize_target.py --target custom --amplitudes "0.707,0.707"
-      python synthesize_target.py --target random --agent ppo
+      python synthesize_target.py --target random --use-best
 
 Named presets (1-qubit):
   zero    : |0⟩  — ground state
@@ -40,11 +36,6 @@ Named presets (1-qubit):
   minus   : |−⟩ = (|0⟩−|1⟩)/√2  — phase state
   i_state : +i Y-eigenstate = (|0⟩+i|1⟩)/√2
   random  : Single Haar-random state (quick demo)
-
-Custom amplitude input (--target custom):
-  Enter comma-separated complex amplitudes, e.g.:  0.707, 0.707
-  Two amplitudes required for the 1-qubit system.
-  The vector is validated (correct dimension, unit norm within tolerance).
 """
 
 import argparse
@@ -52,6 +43,7 @@ import math
 import os
 import sys
 import textwrap
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
@@ -62,8 +54,7 @@ import torch
 import torch.nn as nn
 
 # ── Resolve quantumrl package path ────────────────────────────────────────────
-# The script lives at the project root; quantumrl/ is one level below.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 QUANTUMRL_DIR = os.path.join(SCRIPT_DIR, 'quantumrl')
 sys.path.insert(0, QUANTUMRL_DIR)
 
@@ -73,23 +64,20 @@ from utils import best_checkpoint_path, generate_random_statevector
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 OUTPUTS_DIR = os.path.join(SCRIPT_DIR, 'outputs')
-_INV_SQRT2 = 1.0 / math.sqrt(2.0)
-
-# 1-qubit observation / action sizes (fixed regardless of hidden dim)
-_OBS_SIZE = 10   # 4*(2^1)+2
-_ACT_SIZE = 76   # 4 fixed + 3*24 rotation gates on 1 qubit
+_INV_SQRT2  = 1.0 / math.sqrt(2.0)
 
 # Named preset statevectors (complex128, 1-qubit, unit-norm)
 PRESETS: Dict[str, Optional[np.ndarray]] = {
-    'zero':    np.array([1.0+0j, 0.0+0j],          dtype=np.complex128),
-    'one':     np.array([0.0+0j, 1.0+0j],          dtype=np.complex128),
-    'plus':    np.array([_INV_SQRT2, _INV_SQRT2],   dtype=np.complex128),
-    'minus':   np.array([_INV_SQRT2, -_INV_SQRT2],  dtype=np.complex128),
+    'zero':    np.array([1.0+0j, 0.0+0j],           dtype=np.complex128),
+    'one':     np.array([0.0+0j, 1.0+0j],           dtype=np.complex128),
+    'plus':    np.array([_INV_SQRT2, _INV_SQRT2],    dtype=np.complex128),
+    'minus':   np.array([_INV_SQRT2, -_INV_SQRT2],   dtype=np.complex128),
     'i_state': np.array([_INV_SQRT2, _INV_SQRT2*1j], dtype=np.complex128),
-    'random':  None,  # generated at runtime
+    'random':  None,
 }
 
 NORM_TOLERANCE = 1e-5
+
 
 # ── 1-qubit Config loader ──────────────────────────────────────────────────────
 def _make_one_qubit_config() -> Config:
@@ -104,18 +92,115 @@ def _make_one_qubit_config() -> Config:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Result data structures
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AgentResult:
+    """All data produced by one agent's inference run."""
+    agent_name:  str
+    fidelity:    float
+    gate_count:  int
+    gate_lines:  List[str]
+    png_path:    str
+    qasm_path:   str
+    success:     bool   # fidelity >= FIDELITY_THRESHOLD
+
+
+@dataclass
+class SynthesisResult:
+    """
+    Structured output from synthesize().  Suitable for use by a calling API layer.
+
+    Attributes
+    ----------
+    best_agent       : 'dqn' or 'ppo' — the agent selected as primary result.
+    selection_reason : Human-readable string explaining why this agent was chosen.
+    best_result      : Full AgentResult for the selected agent.
+    other_result     : Full AgentResult for the non-selected agent.
+    target_label     : Display name of the target state (e.g. 'plus', 'custom').
+    target_sv        : The target statevector that was used.
+    """
+    best_agent:       str
+    selection_reason: str
+    best_result:      AgentResult
+    other_result:     AgentResult
+    target_label:     str
+    target_sv:        np.ndarray
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Selection rule
+# ──────────────────────────────────────────────────────────────────────────────
+
+def select_best_result(
+    dqn_result: AgentResult,
+    ppo_result: AgentResult,
+    fidelity_threshold: float,
+    tolerance: float = 1e-6,
+) -> Tuple[AgentResult, AgentResult, str]:
+    """
+    Apply the four-step rule to determine which agent produced the better result.
+
+    Step 1 — Success status differs:
+        If exactly one agent reached fidelity_threshold, that agent wins.
+
+    Step 2 — Both succeed or both fail:
+        The agent with higher fidelity wins.
+
+    Step 3 — Fidelity tied within tolerance:
+        The agent with fewer gates wins.
+
+    Step 4 — Still tied:
+        DQN wins as a deterministic, reproducible default.
+
+    Parameters
+    ----------
+    dqn_result          : AgentResult for the DQN agent.
+    ppo_result          : AgentResult for the PPO agent.
+    fidelity_threshold  : Value from config.FIDELITY_THRESHOLD (typically 0.99).
+    tolerance           : Floating-point tolerance for fidelity equality check.
+
+    Returns
+    -------
+    (best: AgentResult, other: AgentResult, reason: str)
+    """
+    dqn_ok = dqn_result.success
+    ppo_ok = ppo_result.success
+
+    # Step 1 — exactly one agent succeeded
+    if dqn_ok and not ppo_ok:
+        return dqn_result, ppo_result, "dqn succeeded, ppo did not"
+    if ppo_ok and not dqn_ok:
+        return ppo_result, dqn_result, "ppo succeeded, dqn did not"
+
+    # Step 2 — both succeeded or both failed; compare fidelity
+    fid_diff = dqn_result.fidelity - ppo_result.fidelity
+    if abs(fid_diff) > tolerance:
+        if fid_diff > 0:
+            status = "both succeeded" if (dqn_ok and ppo_ok) else "both partial"
+            return dqn_result, ppo_result, f"{status}, dqn had higher fidelity"
+        else:
+            status = "both succeeded" if (dqn_ok and ppo_ok) else "both partial"
+            return ppo_result, dqn_result, f"{status}, ppo had higher fidelity"
+
+    # Step 3 — fidelity tied within tolerance; fewer gates wins
+    if dqn_result.gate_count != ppo_result.gate_count:
+        if dqn_result.gate_count < ppo_result.gate_count:
+            return dqn_result, ppo_result, "tied on fidelity, dqn had fewer gates"
+        else:
+            return ppo_result, dqn_result, "tied on fidelity, ppo had fewer gates"
+
+    # Step 4 — fully tied; prefer DQN as deterministic default
+    return dqn_result, ppo_result, "fully tied — defaulting to dqn"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Network definitions — two layouts, auto-detected from saved weights
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_mlp_branch(in_size: int, h1: int, h2: int, out_size: int) -> nn.Sequential:
-    """
-    Build a 3-hidden-layer MLP whose Sequential indices match saved .pth keys:
-      index 0: Linear(in, h1)   index 1: LayerNorm(h1)   index 2: LeakyReLU (no params)
-      index 3: Linear(h1, h1)   index 4: LayerNorm(h1)   index 5: LeakyReLU (no params)
-      index 6: Linear(h1, h2)   index 7: LayerNorm(h2)   index 8: LeakyReLU (no params)
-      index 9: Linear(h2, out)
-    Works for both legacy (h1=512, h2=256) and new (h1=768, h2=384) hidden dims.
-    """
+    """3-hidden-layer MLP matching saved .pth Sequential index layout."""
     return nn.Sequential(
         nn.Linear(in_size, h1),   # 0
         nn.LayerNorm(h1),          # 1
@@ -131,7 +216,6 @@ def _make_mlp_branch(in_size: int, h1: int, h2: int, out_size: int) -> nn.Sequen
 
 
 class _FlatQNet(nn.Module):
-    """Legacy DQN: single net.* Sequential (old architecture, keys: net.0 … net.9)."""
     def __init__(self, obs_size: int, action_size: int, h1: int, h2: int):
         super().__init__()
         self.net = _make_mlp_branch(obs_size, h1, h2, action_size)
@@ -141,45 +225,28 @@ class _FlatQNet(nn.Module):
 
 
 class _DuelingQNet(nn.Module):
-    """
-    New Dueling DQN: feature_trunk + value_stream + advantage_stream.
-    Keys: feature_trunk.0/1/3/4, value_stream.0/1/3, advantage_stream.0/1/3
-    """
     def __init__(self, obs_size: int, action_size: int, h1: int, h2: int):
         super().__init__()
         self.feature_trunk = nn.Sequential(
-            nn.Linear(obs_size, h1),  # 0
-            nn.LayerNorm(h1),          # 1
-            nn.LeakyReLU(0.01),       # 2
-            nn.Linear(h1, h1),        # 3
-            nn.LayerNorm(h1),          # 4
-            nn.LeakyReLU(0.01),       # 5
+            nn.Linear(obs_size, h1), nn.LayerNorm(h1), nn.LeakyReLU(0.01),
+            nn.Linear(h1, h1),       nn.LayerNorm(h1), nn.LeakyReLU(0.01),
         )
         self.value_stream = nn.Sequential(
-            nn.Linear(h1, h2),   # 0
-            nn.LayerNorm(h2),     # 1
-            nn.LeakyReLU(0.01),  # 2
-            nn.Linear(h2, 1),    # 3
+            nn.Linear(h1, h2), nn.LayerNorm(h2), nn.LeakyReLU(0.01), nn.Linear(h2, 1),
         )
         self.advantage_stream = nn.Sequential(
-            nn.Linear(h1, h2),          # 0
-            nn.LayerNorm(h2),            # 1
-            nn.LeakyReLU(0.01),         # 2
-            nn.Linear(h2, action_size),  # 3
+            nn.Linear(h1, h2), nn.LayerNorm(h2), nn.LeakyReLU(0.01),
+            nn.Linear(h2, action_size),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features   = self.feature_trunk(x)
-        values     = self.value_stream(features)
-        advantages = self.advantage_stream(features)
-        return values + (advantages - advantages.mean(dim=1, keepdim=True))
+        f = self.feature_trunk(x)
+        v = self.value_stream(f)
+        a = self.advantage_stream(f)
+        return v + (a - a.mean(dim=1, keepdim=True))
 
 
 class _ActorCritic(nn.Module):
-    """
-    Actor-Critic for PPO inference (both legacy and new share same key layout).
-    Hidden dims are inferred from the saved state_dict at load time.
-    """
     def __init__(self, obs_size: int, action_size: int, h1: int, h2: int):
         super().__init__()
         self.actor  = _make_mlp_branch(obs_size, h1, h2, action_size)
@@ -190,106 +257,73 @@ class _ActorCritic(nn.Module):
 
 
 def _infer_hidden_dims(state_dict: dict) -> Tuple[int, int]:
-    """
-    Read h1 and h2 from a state_dict by inspecting the first Linear weight.
-    Works for both flat-net (net.0.weight) and actor/critic (actor.0.weight) layouts.
-    """
+    """Infer h1, h2 from saved state_dict by inspecting weight shapes."""
     for key in state_dict:
         if key.endswith('.0.weight'):
-            h1 = state_dict[key].shape[0]
-            # Find h2: the weight going from h1 to h2 is at index 6
+            h1     = state_dict[key].shape[0]
             prefix = key[: key.rfind('.0.weight')]
             h2_key = f'{prefix}.6.weight'
             if h2_key in state_dict:
-                h2 = state_dict[h2_key].shape[0]
-                return h1, h2
-            # Dueling: value_stream.0.weight or advantage_stream.0.weight
+                return h1, state_dict[h2_key].shape[0]
             break
-    # Dueling fallback: value_stream.0.weight gives h2
     for key in state_dict:
-        if 'value_stream.0.weight' in key or key == 'value_stream.0.weight':
-            h2 = state_dict[key].shape[0]
+        if key == 'value_stream.0.weight':
             ft_key = 'feature_trunk.0.weight'
             h1 = state_dict[ft_key].shape[0] if ft_key in state_dict else 768
-            return h1, h2
-    return 512, 256  # safe fallback for oldest legacy models
+            return h1, state_dict[key].shape[0]
+    return 512, 256
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lightweight inference wrappers
+# Inference wrappers
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DQNInferenceAgent:
-    """
-    Greedy DQN inference. Automatically handles both:
-      - Legacy flat net (keys: net.*)
-      - New Dueling net (keys: feature_trunk.*, value_stream.*, advantage_stream.*)
-    """
-
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net: Optional[nn.Module] = None
 
     def load(self, path: str) -> None:
-        sd = torch.load(path, map_location=self.device, weights_only=True)
-
-        # Detect architecture from key names
-        is_dueling = any(k.startswith('feature_trunk') for k in sd)
-        obs_size   = sd['feature_trunk.0.weight'].shape[1] if is_dueling \
-                     else sd['net.0.weight'].shape[1]
-        act_size   = sd['advantage_stream.3.weight'].shape[0] if is_dueling \
-                     else sd['net.9.weight'].shape[0]
-
-        h1, h2 = _infer_hidden_dims(sd)
-
+        sd          = torch.load(path, map_location=self.device, weights_only=True)
+        is_dueling  = any(k.startswith('feature_trunk') for k in sd)
+        obs_size    = sd['feature_trunk.0.weight'].shape[1] if is_dueling else sd['net.0.weight'].shape[1]
+        act_size    = sd['advantage_stream.3.weight'].shape[0] if is_dueling else sd['net.9.weight'].shape[0]
+        h1, h2      = _infer_hidden_dims(sd)
         if is_dueling:
             self.net = _DuelingQNet(obs_size, act_size, h1, h2).to(self.device)
-            arch_label = f'Dueling (h1={h1}, h2={h2})'
+            arch     = f'Dueling h1={h1} h2={h2}'
         else:
             self.net = _FlatQNet(obs_size, act_size, h1, h2).to(self.device)
-            arch_label = f'FlatNet (h1={h1}, h2={h2})'
-
+            arch     = f'FlatNet h1={h1} h2={h2}'
         self.net.load_state_dict(sd)
         self.net.eval()
-        print(f"[DQNAgent] Model loaded <- {path}  [{arch_label}]")
+        print(f"[DQNAgent] Model loaded <- {path}  [{arch}]")
 
     def select_action(self, state: np.ndarray) -> int:
-        """Greedy argmax Q — no exploration."""
-        state_t = torch.tensor(state, dtype=torch.float32,
-                               device=self.device).unsqueeze(0)
+        t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            q_values = self.net(state_t)
-        return int(q_values.argmax(dim=1).item())
+            return int(self.net(t).argmax(dim=1).item())
 
 
 class PPOInferenceAgent:
-    """
-    Greedy PPO inference. Handles both legacy (h1=512) and new (h1=768) hidden dims
-    automatically — PPO always uses the same actor/critic Sequential key layout.
-    """
-
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.ac: Optional[nn.Module] = None
 
     def load(self, path: str) -> None:
-        sd = torch.load(path, map_location=self.device, weights_only=True)
-
+        sd       = torch.load(path, map_location=self.device, weights_only=True)
         obs_size = sd['actor.0.weight'].shape[1]
         act_size = sd['actor.9.weight'].shape[0]
         h1, h2   = _infer_hidden_dims(sd)
-
-        self.ac = _ActorCritic(obs_size, act_size, h1, h2).to(self.device)
+        self.ac  = _ActorCritic(obs_size, act_size, h1, h2).to(self.device)
         self.ac.load_state_dict(sd)
         self.ac.eval()
-        print(f"[PPOAgent] Model loaded <- {path}  [ActorCritic h1={h1}, h2={h2}]")
+        print(f"[PPOAgent] Model loaded <- {path}  [ActorCritic h1={h1} h2={h2}]")
 
     def select_action_greedy(self, state: np.ndarray) -> int:
-        """Deterministic argmax over actor logits — no sampling."""
-        state_t = torch.tensor(state, dtype=torch.float32,
-                               device=self.device).unsqueeze(0)
+        t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            logits, _ = self.ac(state_t)
+            logits, _ = self.ac(t)
         return int(logits.argmax(dim=1).item())
 
 
@@ -298,14 +332,6 @@ class PPOInferenceAgent:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def validate_statevector(sv: np.ndarray, n_qubits: int) -> np.ndarray:
-    """
-    Validate a candidate statevector:
-      - Must have exactly 2^n_qubits amplitudes.
-      - Must be unit-norm within NORM_TOLERANCE.
-
-    Returns the vector as complex128 on success; raises ValueError with a
-    descriptive message on failure.
-    """
     expected_dim = 2 ** n_qubits
     if sv.ndim != 1 or len(sv) != expected_dim:
         raise ValueError(
@@ -316,71 +342,43 @@ def validate_statevector(sv: np.ndarray, n_qubits: int) -> np.ndarray:
     if abs(norm - 1.0) > NORM_TOLERANCE:
         raise ValueError(
             f"Statevector is not unit-normalized (norm = {norm:.6f}). "
-            f"Please normalize your amplitudes so they satisfy |ψ|² = 1."
+            "Please normalize your amplitudes so they satisfy |ψ|² = 1."
         )
     return sv.astype(np.complex128)
 
 
 def parse_custom_amplitudes(raw: str, n_qubits: int) -> np.ndarray:
-    """
-    Parse a comma-separated string of complex amplitudes into a validated
-    complex128 numpy array.
-
-    Examples of valid input:
-        "0.707, 0.707"
-        "0.5+0.5j, 0.5-0.5j"
-        "(0.5+0.5j),(0.5-0.5j)"
-    """
-    raw = raw.strip().strip('"').strip("'")
+    raw   = raw.strip().strip('"').strip("'")
     parts = [p.strip().strip('()') for p in raw.split(',')]
-    expected = 2 ** n_qubits
-    if len(parts) != expected:
+    if len(parts) != 2 ** n_qubits:
         raise ValueError(
-            f"Expected {expected} comma-separated amplitudes, got {len(parts)}."
+            f"Expected {2**n_qubits} comma-separated amplitudes, got {len(parts)}."
         )
     try:
         amplitudes = [complex(p) for p in parts]
     except ValueError as exc:
         raise ValueError(
             f"Could not parse amplitude(s) as complex numbers: {exc}\n"
-            "Use Python complex notation, e.g. '0.707', '0.5+0.5j', '0-0.5j'."
+            "Use Python complex notation, e.g. '0.707', '0.5+0.5j'."
         ) from exc
-
-    sv = np.array(amplitudes, dtype=np.complex128)
-    return validate_statevector(sv, n_qubits)
+    return validate_statevector(np.array(amplitudes, dtype=np.complex128), n_qubits)
 
 
 def get_target_state(
     target_name: str, n_qubits: int, cli_amplitudes: Optional[str] = None
 ) -> Tuple[np.ndarray, str]:
-    """
-    Resolve a target name (preset key, 'custom', or 'random') to a validated
-    statevector.  Returns (statevector: np.ndarray complex128, display_label: str).
-    """
     if target_name == 'random':
-        sv = generate_random_statevector(n_qubits)
-        return validate_statevector(sv, n_qubits), 'random (Haar)'
-
+        return validate_statevector(generate_random_statevector(n_qubits), n_qubits), 'random (Haar)'
     if target_name in PRESETS and PRESETS[target_name] is not None:
-        sv = PRESETS[target_name].copy()
-        return validate_statevector(sv, n_qubits), target_name
-
+        return validate_statevector(PRESETS[target_name].copy(), n_qubits), target_name
     if target_name == 'custom':
         if cli_amplitudes is not None:
-            # CLI path — amplitudes supplied via --amplitudes flag
-            sv = parse_custom_amplitudes(cli_amplitudes, n_qubits)
-        else:
-            # Interactive path
-            expected = 2 ** n_qubits
-            print(
-                f"\nEnter {expected} comma-separated complex amplitudes "
-                f"for a {n_qubits}-qubit state."
-            )
-            print("  Example (1 qubit): 0.707, 0.707")
-            raw = input("  Amplitudes: ").strip()
-            sv = parse_custom_amplitudes(raw, n_qubits)
-        return sv, 'custom'
-
+            return parse_custom_amplitudes(cli_amplitudes, n_qubits), 'custom'
+        expected = 2 ** n_qubits
+        print(f"\nEnter {expected} comma-separated complex amplitudes for a {n_qubits}-qubit state.")
+        print("  Example (1 qubit): 0.707, 0.707")
+        raw = input("  Amplitudes: ").strip()
+        return parse_custom_amplitudes(raw, n_qubits), 'custom'
     raise ValueError(
         f"Unknown target '{target_name}'. "
         f"Valid options: {list(PRESETS.keys()) + ['custom']}"
@@ -388,123 +386,87 @@ def get_target_state(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Human-readable gate formatting
+# Gate formatting
 # ──────────────────────────────────────────────────────────────────────────────
 
 def format_gate(step: int, gate_name: str, qubit_or_pair, angle: Optional[float]) -> str:
-    """Return a human-readable description of one gate application."""
     if gate_name == 'CNOT':
         ctrl, tgt = qubit_or_pair
         return f"  Step {step:2d}: CNOT  ctrl=qubit {ctrl}  tgt=qubit {tgt}"
     if angle is not None:
-        angle_deg = math.degrees(angle)
         return (
-            f"  Step {step:2d}: {gate_name}({angle:.4f} rad = {angle_deg:.2f}°)"
+            f"  Step {step:2d}: {gate_name}({angle:.4f} rad = {math.degrees(angle):.2f}°)"
             f"  on qubit {qubit_or_pair}"
         )
     return f"  Step {step:2d}: {gate_name}  on qubit {qubit_or_pair}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core inference runners
+# Inference runners
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_inference_dqn(
-    agent: DQNInferenceAgent,
-    env: QuantumCircuitEnv,
-    target_sv: np.ndarray,
+    agent: DQNInferenceAgent, env: QuantumCircuitEnv, target_sv: np.ndarray,
 ) -> Tuple[List[str], float, int]:
-    """
-    Run one greedy DQN episode against the given target state.
-    Returns (gate_lines, fidelity, gate_count).
-    """
     obs, _ = env.reset(target_sv=target_sv)
     gate_lines: List[str] = []
     done = False
-    final_fidelity = 0.0
-    final_steps = 0
-
+    final_fidelity, final_steps = 0.0, 0
     while not done:
         action = agent.select_action(obs)
-        gate_name, qubit_or_pair, angle = env.action_list[action]
-        gate_lines.append(format_gate(final_steps + 1, gate_name, qubit_or_pair, angle))
+        gate_lines.append(format_gate(final_steps + 1, *env.action_list[action]))
         obs, _, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-        final_fidelity = info['fidelity']
-        final_steps = info['steps']
-
+        final_fidelity, final_steps = info['fidelity'], info['steps']
     return gate_lines, final_fidelity, final_steps
 
 
 def run_inference_ppo(
-    agent: PPOInferenceAgent,
-    env: QuantumCircuitEnv,
-    target_sv: np.ndarray,
+    agent: PPOInferenceAgent, env: QuantumCircuitEnv, target_sv: np.ndarray,
 ) -> Tuple[List[str], float, int]:
-    """
-    Run one greedy PPO episode against the given target state.
-    Returns (gate_lines, fidelity, gate_count).
-    """
     obs, _ = env.reset(target_sv=target_sv)
     gate_lines: List[str] = []
     done = False
-    final_fidelity = 0.0
-    final_steps = 0
-
+    final_fidelity, final_steps = 0.0, 0
     while not done:
         action = agent.select_action_greedy(obs)
-        gate_name, qubit_or_pair, angle = env.action_list[action]
-        gate_lines.append(format_gate(final_steps + 1, gate_name, qubit_or_pair, angle))
+        gate_lines.append(format_gate(final_steps + 1, *env.action_list[action]))
         obs, _, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-        final_fidelity = info['fidelity']
-        final_steps = info['steps']
-
+        final_fidelity, final_steps = info['fidelity'], info['steps']
     return gate_lines, final_fidelity, final_steps
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Output helpers
+# File output helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_circuit_outputs(env: QuantumCircuitEnv, agent_name: str) -> Tuple[str, str]:
-    """
-    Save circuit diagram (PNG) and QASM code to the outputs/ directory.
-    Returns (png_path, qasm_path).
-    """
+    """Save circuit PNG and QASM to outputs/. Returns (png_path, qasm_path)."""
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
-
     png_path  = os.path.join(OUTPUTS_DIR, f'circuit_{agent_name}.png')
     qasm_path = os.path.join(OUTPUTS_DIR, f'circuit_{agent_name}.qasm')
 
-    # ── PNG circuit diagram ───────────────────────────────────────────────────
     try:
-        # Ensure Agg backend is active before each draw call.
-        # Qiskit's mpl drawer can leave the backend in an inconsistent state
-        # when multiple circuits are rendered in the same process.
         plt.switch_backend('Agg')
         fig = env.current_circuit.draw('mpl', fold=-1)
         if fig is not None and hasattr(fig, 'savefig'):
             fig.savefig(png_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
         else:
-            # Qiskit ≥1.2 returns None; use filename kwarg instead
             env.current_circuit.draw('mpl', filename=png_path, fold=-1)
     except Exception as exc:
-        print(f"  [warn] Could not save PNG diagram: {exc}")
+        print(f"  [warn] Could not save PNG: {exc}")
         png_path = f"(not saved — {exc})"
 
-    # ── QASM export ───────────────────────────────────────────────────────────
     try:
         import qiskit.qasm2 as qasm2
-        qasm_str = qasm2.dumps(env.current_circuit)
         with open(qasm_path, 'w', encoding='utf-8') as f:
-            f.write(qasm_str)
-    except Exception as exc:
+            f.write(qasm2.dumps(env.current_circuit))
+    except Exception:
         try:
-            qasm_str = env.current_circuit.qasm()
             with open(qasm_path, 'w', encoding='utf-8') as f:
-                f.write(qasm_str)
+                f.write(env.current_circuit.qasm())
         except Exception as exc2:
             print(f"  [warn] Could not save QASM: {exc2}")
             qasm_path = f"(not saved — {exc2})"
@@ -512,81 +474,11 @@ def save_circuit_outputs(env: QuantumCircuitEnv, agent_name: str) -> Tuple[str, 
     return png_path, qasm_path
 
 
-def print_agent_result(
-    agent_name: str,
-    gate_lines: List[str],
-    fidelity: float,
-    gate_count: int,
-    png_path: str,
-    qasm_path: str,
-    threshold: float,
-    env: QuantumCircuitEnv,
-) -> None:
-    """Print the full result block for one agent."""
-    success = fidelity >= threshold
-    status  = "SUCCESS" if success else "PARTIAL (below threshold)"
-    bar     = "=" * 60
-
-    print(f"\n{bar}")
-    print(f"  Agent  : {agent_name.upper()}")
-    print(f"  Status : {status}")
-    print(f"  Final fidelity : {fidelity:.6f}  (threshold = {threshold:.2f})")
-    print(f"  Gate count     : {gate_count}")
-    print(bar)
-
-    print("\n  Gate Sequence:")
-    if gate_lines:
-        for line in gate_lines:
-            print(line)
-    else:
-        print("  (no gates applied — already at target state)")
-
-    print(f"\n  ASCII Circuit Diagram:")
-    print()
-    try:
-        env.render()
-    except (UnicodeEncodeError, Exception) as exc:
-        try:
-            print(str(env.current_circuit.draw('text')).encode('ascii', errors='replace').decode('ascii'))
-        except Exception:
-            print("  (ASCII diagram omitted due to console encoding limitations)")
-
-    print(f"\n  Saved outputs:")
-    print(f"    PNG  : {png_path}")
-    print(f"    QASM : {qasm_path}")
-
-
-def print_comparison_table(results: dict, threshold: float) -> None:
-    """Print a side-by-side comparison table for all agents that were run."""
-    if len(results) < 2:
-        return
-
-    agents = list(results.keys())
-    print("\n" + "=" * 60)
-    print("  SIDE-BY-SIDE COMPARISON")
-    print("=" * 60)
-    header_agents = "  ".join(f"{a.upper():>10}" for a in agents)
-    print(f"  {'Metric':<22} {header_agents}")
-    print("  " + "-" * 56)
-
-    rows = [
-        ("Final Fidelity",    "fidelity",   lambda v: f"{v:.6f}"),
-        ("Gate Count",        "gate_count", lambda v: f"{v:>10}"),
-        ("Success (>=thresh)","success",    lambda v: "       Yes" if v else "        No"),
-    ]
-    for label, key, fmt in rows:
-        values = "  ".join(fmt(results[a][key]) for a in agents)
-        print(f"  {label:<22} {values}")
-
-    print("=" * 60)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Agent loading
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_dqn(obs_size: int, action_size: int, model_path: str) -> DQNInferenceAgent:
-    """Load and return a DQN inference agent (auto-detects architecture)."""
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"DQN model not found at: {model_path}\n"
@@ -598,7 +490,6 @@ def load_dqn(obs_size: int, action_size: int, model_path: str) -> DQNInferenceAg
 
 
 def load_ppo(obs_size: int, action_size: int, model_path: str) -> PPOInferenceAgent:
-    """Load and return a PPO inference agent (auto-detects hidden dims)."""
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"PPO model not found at: {model_path}\n"
@@ -610,11 +501,171 @@ def load_ppo(obs_size: int, action_size: int, model_path: str) -> PPOInferenceAg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Interactive prompts
+# Console printing helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _print_agent_result(result: AgentResult, threshold: float, env: QuantumCircuitEnv) -> None:
+    status = "SUCCESS" if result.success else "PARTIAL (below threshold)"
+    bar    = "=" * 60
+    print(f"\n{bar}")
+    print(f"  Agent  : {result.agent_name.upper()}")
+    print(f"  Status : {status}")
+    print(f"  Final fidelity : {result.fidelity:.6f}  (threshold = {threshold:.2f})")
+    print(f"  Gate count     : {result.gate_count}")
+    print(bar)
+    print("\n  Gate Sequence:")
+    if result.gate_lines:
+        for line in result.gate_lines:
+            print(line)
+    else:
+        print("  (no gates applied — already at target state)")
+    print("\n  ASCII Circuit Diagram:\n")
+    try:
+        env.render()
+    except Exception:
+        try:
+            print(str(env.current_circuit.draw('text'))
+                  .encode('ascii', errors='replace').decode('ascii'))
+        except Exception:
+            print("  (ASCII diagram omitted)")
+    print(f"\n  Saved outputs:")
+    print(f"    PNG  : {result.png_path}")
+    print(f"    QASM : {result.qasm_path}")
+
+
+def _print_best_result(synthesis: SynthesisResult, threshold: float) -> None:
+    """Print the BEST RESULT summary section."""
+    b   = synthesis.best_result
+    bar = "=" * 60
+    print(f"\n{bar}")
+    print(f"  BEST RESULT")
+    print(f"{bar}")
+    print(f"  Selected agent : {synthesis.best_agent.upper()}")
+    print(f"  Reason         : {synthesis.selection_reason}")
+    print(f"  Fidelity       : {b.fidelity:.6f}  "
+          f"({'SUCCESS' if b.success else 'PARTIAL'})")
+    print(f"  Gate count     : {b.gate_count}")
+    print(f"\n  Gate Sequence:")
+    if b.gate_lines:
+        for line in b.gate_lines:
+            print(line)
+    else:
+        print("  (no gates applied)")
+    print(f"\n  Output files:")
+    print(f"    PNG  : {b.png_path}")
+    print(f"    QASM : {b.qasm_path}")
+    o = synthesis.other_result
+    print(f"\n  Other agent ({o.agent_name.upper()}) : "
+          f"fidelity={o.fidelity:.6f}  gates={o.gate_count}  "
+          f"({'SUCCESS' if o.success else 'PARTIAL'})")
+    print(bar)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core synthesis function  (importable)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def synthesize(
+    target_sv: np.ndarray,
+    target_label: str,
+    dqn_model_path: str,
+    ppo_model_path: str,
+    fidelity_threshold: float,
+    print_output: bool = True,
+) -> SynthesisResult:
+    """
+    Run both DQN and PPO against ``target_sv`` and return a SynthesisResult.
+
+    This is the importable core function intended for use by a web API layer
+    or any other caller that wants structured data rather than console output.
+
+    Parameters
+    ----------
+    target_sv           : Validated, normalised 1-qubit statevector (complex128).
+    target_label        : Human-readable name for the target (e.g. 'plus').
+    dqn_model_path      : Absolute path to the DQN .pth file.
+    ppo_model_path      : Absolute path to the PPO .pth file.
+    fidelity_threshold  : Value from Config.FIDELITY_THRESHOLD.
+    print_output        : If True, prints all console sections (default True for CLI use).
+
+    Returns
+    -------
+    SynthesisResult
+        best_agent, selection_reason, best_result, other_result, target_label,
+        target_sv — see SynthesisResult dataclass for full field documentation.
+    """
+    config_1q   = _make_one_qubit_config()
+    env         = QuantumCircuitEnv(config_1q)
+    obs_size    = env.observation_space.shape[0]
+    action_size = env.action_space.n
+
+    # ── Load both agents ──────────────────────────────────────────────────────
+    dqn_agent = load_dqn(obs_size, action_size, dqn_model_path)
+    ppo_agent = load_ppo(obs_size, action_size, ppo_model_path)
+
+    # ── Run DQN inference ─────────────────────────────────────────────────────
+    if print_output:
+        print("\n[synthesize] Running DQN inference (greedy, epsilon=0) ...")
+    dqn_gate_lines, dqn_fidelity, dqn_gate_count = run_inference_dqn(
+        dqn_agent, env, target_sv
+    )
+    dqn_png, dqn_qasm = save_circuit_outputs(env, 'dqn')
+    dqn_result = AgentResult(
+        agent_name='dqn',
+        fidelity=dqn_fidelity,
+        gate_count=dqn_gate_count,
+        gate_lines=dqn_gate_lines,
+        png_path=dqn_png,
+        qasm_path=dqn_qasm,
+        success=(dqn_fidelity >= fidelity_threshold),
+    )
+    if print_output:
+        _print_agent_result(dqn_result, fidelity_threshold, env)
+
+    # ── Run PPO inference ─────────────────────────────────────────────────────
+    if print_output:
+        print("\n[synthesize] Running PPO inference (greedy, deterministic argmax) ...")
+    ppo_gate_lines, ppo_fidelity, ppo_gate_count = run_inference_ppo(
+        ppo_agent, env, target_sv
+    )
+    ppo_png, ppo_qasm = save_circuit_outputs(env, 'ppo')
+    ppo_result = AgentResult(
+        agent_name='ppo',
+        fidelity=ppo_fidelity,
+        gate_count=ppo_gate_count,
+        gate_lines=ppo_gate_lines,
+        png_path=ppo_png,
+        qasm_path=ppo_qasm,
+        success=(ppo_fidelity >= fidelity_threshold),
+    )
+    if print_output:
+        _print_agent_result(ppo_result, fidelity_threshold, env)
+
+    # ── Select best ───────────────────────────────────────────────────────────
+    best_r, other_r, reason = select_best_result(
+        dqn_result, ppo_result, fidelity_threshold
+    )
+
+    synthesis = SynthesisResult(
+        best_agent=best_r.agent_name,
+        selection_reason=reason,
+        best_result=best_r,
+        other_result=other_r,
+        target_label=target_label,
+        target_sv=target_sv,
+    )
+
+    if print_output:
+        _print_best_result(synthesis, fidelity_threshold)
+
+    return synthesis
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Target prompt (interactive)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def prompt_target() -> str:
-    """Interactively ask the user for a target state name."""
     valid = list(PRESETS.keys()) + ['custom']
     descriptions = {
         'zero':    '|0⟩  — ground state',
@@ -628,24 +679,11 @@ def prompt_target() -> str:
     print("\nAvailable target states:")
     for name in valid:
         print(f"  {name:<10} — {descriptions.get(name, '')}")
-
     while True:
         choice = input("\nTarget state [default: plus]: ").strip().lower() or 'plus'
         if choice in valid:
             return choice
         print(f"  Invalid choice '{choice}'. Pick from: {', '.join(valid)}")
-
-
-def prompt_agent() -> str:
-    """Interactively ask the user which agent(s) to run."""
-    while True:
-        choice = (
-            input("Agent to run — dqn / ppo / both [default: both]: ")
-            .strip().lower() or 'both'
-        )
-        if choice in ('dqn', 'ppo', 'both'):
-            return choice
-        print("  Invalid choice. Enter 'dqn', 'ppo', or 'both'.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -658,6 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog='synthesize_target.py',
         description=textwrap.dedent("""\
             Target-state-to-circuit synthesis using trained RL agents.
+            Both DQN and PPO run on every invocation; the best result is
+            selected automatically and presented as the primary output.
             Run with no arguments for interactive mode.
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -672,19 +712,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        '--agent', '-a',
-        choices=['dqn', 'ppo', 'both'],
-        default=None,
-        help="Which agent(s) to run: dqn, ppo, or both (default: both).",
-    )
-    parser.add_argument(
         '--amplitudes', '-amp',
         default=None,
         metavar='AMPLITUDES',
         help=(
             "Comma-separated complex amplitudes for --target custom. "
-            "Example: '0.707,0.707'  (1-qubit system needs 2 values). "
-            "Skips the interactive amplitude prompt when provided."
+            "Example: '0.707,0.707'  (1-qubit system needs 2 values)."
         ),
     )
     parser.add_argument(
@@ -692,9 +725,8 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         default=False,
         help=(
-            'Load the best checkpoint (e.g. dqn_model_best.pth / ppo_model_best.pth) '
-            'instead of the final saved model.  The best checkpoint is written '
-            'automatically during training at every BEST_CHECKPOINT_EVAL_INTERVAL episodes.'
+            'Load the best checkpoint (dqn_model_best.pth / ppo_model_best.pth) '
+            'instead of the final saved model.'
         ),
     )
     return parser
@@ -705,29 +737,24 @@ def build_parser() -> argparse.ArgumentParser:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    parser  = build_parser()
+    args    = parser.parse_args()
 
-    # ── Determine interactive vs CLI mode ─────────────────────────────────────
-    interactive = (args.target is None) and (args.agent is None)
+    # interactive mode when no target is given
+    interactive = args.target is None
 
     if interactive:
         print("=" * 60)
         print("  QuantumRL — Target-State Circuit Synthesis")
         print("  (Interactive Mode — run with --help for CLI flags)")
         print("=" * 60)
-        target_name  = prompt_target()
-        agent_choice = prompt_agent()
+        target_name = prompt_target()
     else:
-        target_name  = args.target or 'plus'
-        agent_choice = args.agent  or 'both'
+        target_name = args.target
 
-    # ── Build 1-qubit environment (matches trained model dimensions) ──────────
-    config_1q = _make_one_qubit_config()
-    env = QuantumCircuitEnv(config_1q)
-    n_qubits    = config_1q.NUM_QUBITS   # 1
-    obs_size    = env.observation_space.shape[0]  # 10
-    action_size = env.action_space.n              # 76
+    # ── Config and environment info ───────────────────────────────────────────
+    config_1q   = _make_one_qubit_config()
+    n_qubits    = config_1q.NUM_QUBITS
 
     # ── Resolve target statevector ────────────────────────────────────────────
     try:
@@ -743,86 +770,43 @@ def main() -> None:
     print(f"  Target state : {target_label}")
     print(f"  Amplitudes   : {np.round(target_sv, 4)}")
     print(f"  Norm         : {np.linalg.norm(target_sv):.8f}")
-    print(f"  System       : {n_qubits} qubit  |  obs={obs_size}  actions={action_size}")
-    print(f"  Agents       : {agent_choice}")
+    print(f"  Running      : DQN + PPO (both agents, best selected automatically)")
     print(f"{'=' * 60}")
 
-    # ── Resolve model file paths ──────────────────────────────────────────────
-    def _resolve_model_path(rel_path: str) -> str:
-        candidates = [
+    # ── Resolve model paths ───────────────────────────────────────────────────
+    def _resolve(rel_path: str) -> str:
+        for candidate in [
             os.path.join(QUANTUMRL_DIR, rel_path),
             os.path.join(SCRIPT_DIR, rel_path),
             rel_path,
-        ]
-        for p in candidates:
-            if os.path.exists(p):
-                return p
-        return candidates[0]
+        ]:
+            if os.path.exists(candidate):
+                return candidate
+        return os.path.join(QUANTUMRL_DIR, rel_path)
 
-    dqn_model_path = _resolve_model_path(config_1q.DQN_MODEL_PATH)
-    ppo_model_path = _resolve_model_path(config_1q.PPO_MODEL_PATH)
+    dqn_model_path = _resolve(config_1q.DQN_MODEL_PATH)
+    ppo_model_path = _resolve(config_1q.PPO_MODEL_PATH)
 
     if args.use_best:
-        dqn_model_path = _resolve_model_path(best_checkpoint_path(config_1q.DQN_MODEL_PATH))
-        ppo_model_path = _resolve_model_path(best_checkpoint_path(config_1q.PPO_MODEL_PATH))
-        print(f"[synthesize] --use-best: using best checkpoints.")
+        dqn_model_path = _resolve(best_checkpoint_path(config_1q.DQN_MODEL_PATH))
+        ppo_model_path = _resolve(best_checkpoint_path(config_1q.PPO_MODEL_PATH))
+        print(f"[synthesize] --use-best: loading best checkpoints.")
         print(f"[synthesize]   DQN: {dqn_model_path}")
         print(f"[synthesize]   PPO: {ppo_model_path}")
 
-    # ── Load requested agents ─────────────────────────────────────────────────
-    print()
-    dqn_agent: Optional[DQNInferenceAgent] = None
-    ppo_agent: Optional[PPOInferenceAgent] = None
-
-    if agent_choice in ('dqn', 'both'):
-        print("[synthesize] Loading DQN ...")
-        try:
-            dqn_agent = load_dqn(obs_size, action_size, dqn_model_path)
-        except FileNotFoundError as exc:
-            print(f"[error] {exc}", file=sys.stderr)
-            sys.exit(1)
-
-    if agent_choice in ('ppo', 'both'):
-        print("[synthesize] Loading PPO ...")
-        try:
-            ppo_agent = load_ppo(obs_size, action_size, ppo_model_path)
-        except FileNotFoundError as exc:
-            print(f"[error] {exc}", file=sys.stderr)
-            sys.exit(1)
-
-    # ── Run inference ─────────────────────────────────────────────────────────
-    comparison_results: dict = {}
-
-    if dqn_agent is not None:
-        print("\n[synthesize] Running DQN inference (greedy, epsilon=0) ...")
-        gate_lines, fidelity, gate_count = run_inference_dqn(dqn_agent, env, target_sv)
-        png_path, qasm_path = save_circuit_outputs(env, 'dqn')
-        print_agent_result(
-            'dqn', gate_lines, fidelity, gate_count,
-            png_path, qasm_path, config_1q.FIDELITY_THRESHOLD, env,
+    # ── Run synthesis (both agents, select best) ──────────────────────────────
+    try:
+        result = synthesize(
+            target_sv=target_sv,
+            target_label=target_label,
+            dqn_model_path=dqn_model_path,
+            ppo_model_path=ppo_model_path,
+            fidelity_threshold=config_1q.FIDELITY_THRESHOLD,
+            print_output=True,
         )
-        comparison_results['dqn'] = {
-            'fidelity':   fidelity,
-            'gate_count': gate_count,
-            'success':    fidelity >= config_1q.FIDELITY_THRESHOLD,
-        }
-
-    if ppo_agent is not None:
-        print("\n[synthesize] Running PPO inference (greedy, deterministic argmax) ...")
-        gate_lines, fidelity, gate_count = run_inference_ppo(ppo_agent, env, target_sv)
-        png_path, qasm_path = save_circuit_outputs(env, 'ppo')
-        print_agent_result(
-            'ppo', gate_lines, fidelity, gate_count,
-            png_path, qasm_path, config_1q.FIDELITY_THRESHOLD, env,
-        )
-        comparison_results['ppo'] = {
-            'fidelity':   fidelity,
-            'gate_count': gate_count,
-            'success':    fidelity >= config_1q.FIDELITY_THRESHOLD,
-        }
-
-    # ── Comparison table (only when both agents ran) ──────────────────────────
-    print_comparison_table(comparison_results, config_1q.FIDELITY_THRESHOLD)
+    except FileNotFoundError as exc:
+        print(f"\n[error] {exc}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"\n[synthesize] Done. Output files saved to: {OUTPUTS_DIR}")
 
